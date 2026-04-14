@@ -20,7 +20,7 @@ const googleAuth = worker.oauth("googleAuth", {
 	},
 });
 
-// --- Database ---
+// --- Databases ---
 
 const pagesDb = worker.database("pagesPathReportDb", {
 	type: "managed",
@@ -40,30 +40,49 @@ const pagesDb = worker.database("pagesPathReportDb", {
 	},
 });
 
+const trafficDb = worker.database("trafficSourceMediumDb", {
+	type: "managed",
+	initialTitle: "Traffic Session Source Medium Report",
+	primaryKeyProperty: "Name",
+	schema: {
+		databaseIcon: Builder.emojiIcon("🚥"),
+		properties: {
+			"Name": Schema.title(),
+			"Date": Schema.date("YYYY/MM/DD"),
+			"Session Source": Schema.richText(),
+			"Session Medium": Schema.richText(),
+			"Sessions": Schema.number(),
+			"Users": Schema.number(),
+		},
+	},
+});
+
 // --- GA4 API helper ---
 
-interface GA4Row {
-	date: string;
-	pagePath: string;
-	screenPageViews: number;
-	newUsers: number;
-	totalUsers: number;
-	userEngagementDuration: number;
+interface GA4ReportConfig {
+	dimensions: string[];
+	metrics: string[];
 }
 
-interface GA4Response {
-	rows: GA4Row[];
+interface GA4RawRow {
+	dimensionValues: Array<{ value: string }>;
+	metricValues: Array<{ value: string }>;
+}
+
+interface GA4RawResponse {
+	rows: GA4RawRow[];
 	totalRows: number;
 }
 
 async function fetchGA4Report(
 	token: string,
 	propertyId: string,
+	config: GA4ReportConfig,
 	startDate: string,
 	endDate: string,
 	limit: number,
 	offset: number,
-): Promise<GA4Response> {
+): Promise<GA4RawResponse> {
 	const url = `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`;
 
 	const response = await fetch(url, {
@@ -74,13 +93,8 @@ async function fetchGA4Report(
 		},
 		body: JSON.stringify({
 			dateRanges: [{ startDate, endDate }],
-			dimensions: [{ name: "date" }, { name: "pagePath" }],
-			metrics: [
-				{ name: "screenPageViews" },
-				{ name: "newUsers" },
-				{ name: "totalUsers" },
-				{ name: "userEngagementDuration" },
-			],
+			dimensions: config.dimensions.map((name) => ({ name })),
+			metrics: config.metrics.map((name) => ({ name })),
 			limit,
 			offset,
 		}),
@@ -92,23 +106,14 @@ async function fetchGA4Report(
 	}
 
 	const data = (await response.json()) as {
-		rows?: Array<{
-			dimensionValues: Array<{ value: string }>;
-			metricValues: Array<{ value: string }>;
-		}>;
+		rows?: GA4RawRow[];
 		rowCount?: number;
 	};
 
-	const rows: GA4Row[] = (data.rows ?? []).map((row) => ({
-		date: row.dimensionValues[0].value,
-		pagePath: row.dimensionValues[1].value,
-		screenPageViews: parseInt(row.metricValues[0].value, 10),
-		newUsers: parseInt(row.metricValues[1].value, 10),
-		totalUsers: parseInt(row.metricValues[2].value, 10),
-		userEngagementDuration: parseFloat(row.metricValues[3].value),
-	}));
-
-	return { rows, totalRows: data.rowCount ?? 0 };
+	return {
+		rows: data.rows ?? [],
+		totalRows: data.rowCount ?? 0,
+	};
 }
 
 function formatGA4Date(yyyymmdd: string): string {
@@ -121,7 +126,7 @@ function getDateNDaysAgo(n: number): string {
 	return d.toISOString().slice(0, 10);
 }
 
-// --- Sync ---
+// --- Shared constants ---
 
 const BATCH_SIZE = 250;
 const LOOKBACK_DAYS = 30;
@@ -129,6 +134,13 @@ const LOOKBACK_DAYS = 30;
 interface SyncState {
 	offset: number;
 }
+
+// --- Pages Path Report Sync ---
+
+const pagesReportConfig: GA4ReportConfig = {
+	dimensions: ["date", "pagePath"],
+	metrics: ["screenPageViews", "newUsers", "totalUsers", "userEngagementDuration"],
+};
 
 worker.sync("pagesPathReport", {
 	database: pagesDb,
@@ -146,27 +158,81 @@ worker.sync("pagesPathReport", {
 		const endDate = getDateNDaysAgo(1);
 
 		const { rows, totalRows } = await fetchGA4Report(
-			token,
-			propertyId,
-			startDate,
-			endDate,
-			BATCH_SIZE,
-			offset,
+			token, propertyId, pagesReportConfig, startDate, endDate, BATCH_SIZE, offset,
 		);
 
-		const changes = rows.map((row) => ({
-			type: "upsert" as const,
-			key: `${row.date}::${row.pagePath}`,
-			properties: {
-				"Name": Builder.title(row.pagePath),
-				"Date": Builder.date(formatGA4Date(row.date)),
-				"Page Path": Builder.richText(row.pagePath),
-				"Screen Page Views": Builder.number(row.screenPageViews),
-				"New Users": Builder.number(row.newUsers),
-				"Total Users": Builder.number(row.totalUsers),
-				"User Engagement Duration": Builder.number(row.userEngagementDuration),
-			},
-		}));
+		const changes = rows.map((row) => {
+			const date = row.dimensionValues[0].value;
+			const pagePath = row.dimensionValues[1].value;
+			return {
+				type: "upsert" as const,
+				key: `${date}::${pagePath}`,
+				properties: {
+					"Name": Builder.title(pagePath),
+					"Date": Builder.date(formatGA4Date(date)),
+					"Page Path": Builder.richText(pagePath),
+					"Screen Page Views": Builder.number(parseInt(row.metricValues[0].value, 10)),
+					"New Users": Builder.number(parseInt(row.metricValues[1].value, 10)),
+					"Total Users": Builder.number(parseInt(row.metricValues[2].value, 10)),
+					"User Engagement Duration": Builder.number(parseFloat(row.metricValues[3].value)),
+				},
+			};
+		});
+
+		const nextOffset = offset + rows.length;
+		const hasMore = nextOffset < totalRows;
+
+		return {
+			changes,
+			hasMore,
+			nextState: hasMore ? { offset: nextOffset } : undefined,
+		};
+	},
+});
+
+// --- Traffic Session Source Medium Report Sync ---
+
+const trafficReportConfig: GA4ReportConfig = {
+	dimensions: ["date", "sessionSource", "sessionMedium"],
+	metrics: ["sessions", "totalUsers"],
+};
+
+worker.sync("trafficSourceMediumReport", {
+	database: trafficDb,
+	schedule: "1h",
+	mode: "replace",
+	execute: async (state: SyncState | undefined) => {
+		const propertyId = process.env.GA4_PROPERTY_ID;
+		if (!propertyId) {
+			throw new Error("GA4_PROPERTY_ID secret is not set");
+		}
+
+		const token = await googleAuth.accessToken();
+		const offset = state?.offset ?? 0;
+		const startDate = getDateNDaysAgo(LOOKBACK_DAYS);
+		const endDate = getDateNDaysAgo(1);
+
+		const { rows, totalRows } = await fetchGA4Report(
+			token, propertyId, trafficReportConfig, startDate, endDate, BATCH_SIZE, offset,
+		);
+
+		const changes = rows.map((row) => {
+			const date = row.dimensionValues[0].value;
+			const source = row.dimensionValues[1].value;
+			const medium = row.dimensionValues[2].value;
+			return {
+				type: "upsert" as const,
+				key: `${date}::${source}::${medium}`,
+				properties: {
+					"Name": Builder.title(`${source} / ${medium}`),
+					"Date": Builder.date(formatGA4Date(date)),
+					"Session Source": Builder.richText(source),
+					"Session Medium": Builder.richText(medium),
+					"Sessions": Builder.number(parseInt(row.metricValues[0].value, 10)),
+					"Users": Builder.number(parseInt(row.metricValues[1].value, 10)),
+				},
+			};
+		});
 
 		const nextOffset = offset + rows.length;
 		const hasMore = nextOffset < totalRows;
