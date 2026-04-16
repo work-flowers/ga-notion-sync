@@ -1,24 +1,72 @@
 import { Worker } from "@notionhq/workers";
 import * as Schema from "@notionhq/workers/schema";
 import * as Builder from "@notionhq/workers/builder";
+import { createSign } from "node:crypto";
 
 const worker = new Worker();
 export default worker;
 
-// --- OAuth ---
+// --- Service account auth ---
 
-const googleAuth = worker.oauth("googleAuth", {
-	name: "google-analytics-oauth",
-	authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
-	tokenEndpoint: "https://oauth2.googleapis.com/token",
-	scope: "https://www.googleapis.com/auth/analytics.readonly",
-	clientId: process.env.GOOGLE_CLIENT_ID ?? "",
-	clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
-	authorizationParams: {
-		access_type: "offline",
-		prompt: "consent",
-	},
-});
+interface ServiceAccountKey {
+	client_email: string;
+	private_key: string;
+	token_uri?: string;
+}
+
+function base64url(input: Buffer | string): string {
+	return Buffer.from(input)
+		.toString("base64")
+		.replace(/=+$/, "")
+		.replace(/\+/g, "-")
+		.replace(/\//g, "_");
+}
+
+async function getServiceAccountToken(scope: string): Promise<string> {
+	const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+	if (!raw) {
+		throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON secret is not set");
+	}
+
+	const key = JSON.parse(raw) as ServiceAccountKey;
+	const tokenUri = key.token_uri ?? "https://oauth2.googleapis.com/token";
+
+	const now = Math.floor(Date.now() / 1000);
+	const header = { alg: "RS256", typ: "JWT" };
+	const claims = {
+		iss: key.client_email,
+		scope,
+		aud: tokenUri,
+		iat: now,
+		exp: now + 3600,
+	};
+
+	const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
+	const signer = createSign("RSA-SHA256");
+	signer.update(signingInput);
+	signer.end();
+	const signature = base64url(signer.sign(key.private_key));
+	const jwt = `${signingInput}.${signature}`;
+
+	const response = await fetch(tokenUri, {
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			assertion: jwt,
+		}),
+	});
+
+	if (!response.ok) {
+		const body = await response.text();
+		throw new Error(`Token exchange failed ${response.status}: ${body}`);
+	}
+
+	const data = (await response.json()) as { access_token: string };
+	return data.access_token;
+}
+
+const GA4_SCOPE = "https://www.googleapis.com/auth/analytics.readonly";
 
 // --- Databases ---
 
@@ -152,7 +200,7 @@ worker.sync("pagesPathReport", {
 			throw new Error("GA4_PROPERTY_ID secret is not set");
 		}
 
-		const token = await googleAuth.accessToken();
+		const token = await getServiceAccountToken(GA4_SCOPE);
 		const offset = state?.offset ?? 0;
 		const startDate = getDateNDaysAgo(LOOKBACK_DAYS);
 		const endDate = getDateNDaysAgo(1);
@@ -207,7 +255,7 @@ worker.sync("trafficSourceMediumReport", {
 			throw new Error("GA4_PROPERTY_ID secret is not set");
 		}
 
-		const token = await googleAuth.accessToken();
+		const token = await getServiceAccountToken(GA4_SCOPE);
 		const offset = state?.offset ?? 0;
 		const startDate = getDateNDaysAgo(LOOKBACK_DAYS);
 		const endDate = getDateNDaysAgo(1);
