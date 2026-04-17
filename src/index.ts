@@ -216,7 +216,7 @@ worker.sync("pagesPathReport", {
 				type: "upsert" as const,
 				key: `${date}::${pagePath}`,
 				properties: {
-					"Name": Builder.title(pagePath),
+					"Name": Builder.title(`${date}::${pagePath}`),
 					"Date": Builder.date(formatGA4Date(date)),
 					"Page Path": Builder.richText(pagePath),
 					"Screen Page Views": Builder.number(parseInt(row.metricValues[0].value, 10)),
@@ -272,7 +272,7 @@ worker.sync("trafficSourceMediumReport", {
 				type: "upsert" as const,
 				key: `${date}::${source}::${medium}`,
 				properties: {
-					"Name": Builder.title(`${source} / ${medium}`),
+					"Name": Builder.title(`${date}::${source}::${medium}`),
 					"Date": Builder.date(formatGA4Date(date)),
 					"Session Source": Builder.richText(source),
 					"Session Medium": Builder.richText(medium),
