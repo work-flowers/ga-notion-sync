@@ -22,7 +22,14 @@ function base64url(input: Buffer | string): string {
 		.replace(/\//g, "_");
 }
 
+let cachedAccessToken: { token: string; expiresAt: number } | null = null;
+
 async function getServiceAccountToken(scope: string): Promise<string> {
+	const nowMs = Date.now();
+	if (cachedAccessToken && cachedAccessToken.expiresAt > nowMs + 60_000) {
+		return cachedAccessToken.token;
+	}
+
 	const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 	if (!raw) {
 		throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON secret is not set");
@@ -31,14 +38,14 @@ async function getServiceAccountToken(scope: string): Promise<string> {
 	const key = JSON.parse(raw) as ServiceAccountKey;
 	const tokenUri = key.token_uri ?? "https://oauth2.googleapis.com/token";
 
-	const now = Math.floor(Date.now() / 1000);
+	const iat = Math.floor(nowMs / 1000);
 	const header = { alg: "RS256", typ: "JWT" };
 	const claims = {
 		iss: key.client_email,
 		scope,
 		aud: tokenUri,
-		iat: now,
-		exp: now + 3600,
+		iat,
+		exp: iat + 3600,
 	};
 
 	const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
@@ -62,11 +69,20 @@ async function getServiceAccountToken(scope: string): Promise<string> {
 		throw new Error(`Token exchange failed ${response.status}: ${body}`);
 	}
 
-	const data = (await response.json()) as { access_token: string };
+	const data = (await response.json()) as { access_token: string; expires_in?: number };
+	const expiresInMs = (data.expires_in ?? 3600) * 1000;
+	cachedAccessToken = { token: data.access_token, expiresAt: nowMs + expiresInMs };
 	return data.access_token;
 }
 
 const GA4_SCOPE = "https://www.googleapis.com/auth/analytics.readonly";
+
+// --- Pacer ---
+
+const ga4Pacer = worker.pacer("ga4Api", {
+	allowedRequests: 100,
+	intervalMs: 60_000,
+});
 
 // --- Databases ---
 
@@ -170,125 +186,164 @@ function formatGA4Date(yyyymmdd: string): string {
 
 function getDateNDaysAgo(n: number): string {
 	const d = new Date();
-	d.setDate(d.getDate() - n);
+	d.setUTCDate(d.getUTCDate() - n);
 	return d.toISOString().slice(0, 10);
 }
 
-// --- Shared constants ---
+// --- Shared sync builder ---
 
 const BATCH_SIZE = 250;
-const LOOKBACK_DAYS = 30;
+// Backfill window starts before GA4's earliest practical data. Out-of-range
+// dates just return empty rows, so this is safe.
+const BACKFILL_START_DATE = "2020-01-01";
+// Delta refetches a few days back from yesterday — GA4 metrics for the most
+// recent days are still settling (late hits, attribution).
+const DELTA_LOOKBACK_DAYS = 3;
 
 interface SyncState {
 	offset: number;
 }
 
-// --- Pages Path Report Sync ---
+function makeGA4Execute<C>(opts: {
+	config: GA4ReportConfig;
+	mapRow: (row: GA4RawRow) => C;
+	startDate: () => string;
+	endDate: () => string;
+}) {
+	return async (state: SyncState | undefined) => {
+		const propertyId = process.env.GA4_PROPERTY_ID;
+		if (!propertyId) {
+			throw new Error("GA4_PROPERTY_ID secret is not set");
+		}
+
+		const offset = state?.offset ?? 0;
+
+		await ga4Pacer.wait();
+		const token = await getServiceAccountToken(GA4_SCOPE);
+		const { rows, totalRows } = await fetchGA4Report(
+			token,
+			propertyId,
+			opts.config,
+			opts.startDate(),
+			opts.endDate(),
+			BATCH_SIZE,
+			offset,
+		);
+
+		const changes = rows.map(opts.mapRow);
+
+		const nextOffset = offset + rows.length;
+		// Guard against a no-progress loop if the API returns 0 rows but a
+		// non-zero totalRows.
+		const hasMore = rows.length > 0 && nextOffset < totalRows;
+
+		return {
+			changes,
+			hasMore,
+			nextState: hasMore ? { offset: nextOffset } : undefined,
+		};
+	};
+}
+
+// --- Pages Path Report ---
 
 const pagesReportConfig: GA4ReportConfig = {
 	dimensions: ["date", "pagePath"],
 	metrics: ["screenPageViews", "newUsers", "totalUsers", "userEngagementDuration"],
 };
 
-worker.sync("pagesPathReport", {
+function mapPagesRow(row: GA4RawRow) {
+	const date = row.dimensionValues[0].value;
+	const pagePath = row.dimensionValues[1].value;
+	const key = `${date}::${pagePath}`;
+	return {
+		type: "upsert" as const,
+		key,
+		properties: {
+			"Name": Builder.title(key),
+			"Date": Builder.date(formatGA4Date(date)),
+			"Page Path": Builder.richText(pagePath),
+			"Screen Page Views": Builder.number(parseInt(row.metricValues[0].value, 10)),
+			"New Users": Builder.number(parseInt(row.metricValues[1].value, 10)),
+			"Total Users": Builder.number(parseInt(row.metricValues[2].value, 10)),
+			"User Engagement Duration": Builder.number(parseFloat(row.metricValues[3].value)),
+		},
+	};
+}
+
+// Backfill: full history, triggered manually. Used for initial load,
+// schema migrations, and recovery.
+worker.sync("pagesPathBackfill", {
 	database: pagesDb,
-	schedule: "1h",
 	mode: "replace",
-	execute: async (state: SyncState | undefined) => {
-		const propertyId = process.env.GA4_PROPERTY_ID;
-		if (!propertyId) {
-			throw new Error("GA4_PROPERTY_ID secret is not set");
-		}
-
-		const token = await getServiceAccountToken(GA4_SCOPE);
-		const offset = state?.offset ?? 0;
-		const startDate = getDateNDaysAgo(LOOKBACK_DAYS);
-		const endDate = getDateNDaysAgo(1);
-
-		const { rows, totalRows } = await fetchGA4Report(
-			token, propertyId, pagesReportConfig, startDate, endDate, BATCH_SIZE, offset,
-		);
-
-		const changes = rows.map((row) => {
-			const date = row.dimensionValues[0].value;
-			const pagePath = row.dimensionValues[1].value;
-			return {
-				type: "upsert" as const,
-				key: `${date}::${pagePath}`,
-				properties: {
-					"Name": Builder.title(`${date}::${pagePath}`),
-					"Date": Builder.date(formatGA4Date(date)),
-					"Page Path": Builder.richText(pagePath),
-					"Screen Page Views": Builder.number(parseInt(row.metricValues[0].value, 10)),
-					"New Users": Builder.number(parseInt(row.metricValues[1].value, 10)),
-					"Total Users": Builder.number(parseInt(row.metricValues[2].value, 10)),
-					"User Engagement Duration": Builder.number(parseFloat(row.metricValues[3].value)),
-				},
-			};
-		});
-
-		const nextOffset = offset + rows.length;
-		const hasMore = nextOffset < totalRows;
-
-		return {
-			changes,
-			hasMore,
-			nextState: hasMore ? { offset: nextOffset } : undefined,
-		};
-	},
+	schedule: "manual",
+	execute: makeGA4Execute({
+		config: pagesReportConfig,
+		mapRow: mapPagesRow,
+		startDate: () => BACKFILL_START_DATE,
+		endDate: () => getDateNDaysAgo(1),
+	}),
 });
 
-// --- Traffic Session Source Medium Report Sync ---
+// Delta: refresh the most recent days every hour. Incremental — never deletes.
+worker.sync("pagesPathDelta", {
+	database: pagesDb,
+	mode: "incremental",
+	schedule: "1h",
+	execute: makeGA4Execute({
+		config: pagesReportConfig,
+		mapRow: mapPagesRow,
+		startDate: () => getDateNDaysAgo(DELTA_LOOKBACK_DAYS),
+		endDate: () => getDateNDaysAgo(1),
+	}),
+});
+
+// --- Traffic Source/Medium Report ---
 
 const trafficReportConfig: GA4ReportConfig = {
 	dimensions: ["date", "sessionSource", "sessionMedium"],
 	metrics: ["sessions", "totalUsers"],
 };
 
-worker.sync("trafficSourceMediumReport", {
+function mapTrafficRow(row: GA4RawRow) {
+	const date = row.dimensionValues[0].value;
+	const source = row.dimensionValues[1].value;
+	const medium = row.dimensionValues[2].value;
+	const key = `${date}::${source}::${medium}`;
+	return {
+		type: "upsert" as const,
+		key,
+		properties: {
+			"Name": Builder.title(key),
+			"Date": Builder.date(formatGA4Date(date)),
+			"Session Source": Builder.richText(source),
+			"Session Medium": Builder.richText(medium),
+			"Sessions": Builder.number(parseInt(row.metricValues[0].value, 10)),
+			"Users": Builder.number(parseInt(row.metricValues[1].value, 10)),
+		},
+	};
+}
+
+worker.sync("trafficSourceMediumBackfill", {
 	database: trafficDb,
-	schedule: "1h",
 	mode: "replace",
-	execute: async (state: SyncState | undefined) => {
-		const propertyId = process.env.GA4_PROPERTY_ID;
-		if (!propertyId) {
-			throw new Error("GA4_PROPERTY_ID secret is not set");
-		}
+	schedule: "manual",
+	execute: makeGA4Execute({
+		config: trafficReportConfig,
+		mapRow: mapTrafficRow,
+		startDate: () => BACKFILL_START_DATE,
+		endDate: () => getDateNDaysAgo(1),
+	}),
+});
 
-		const token = await getServiceAccountToken(GA4_SCOPE);
-		const offset = state?.offset ?? 0;
-		const startDate = getDateNDaysAgo(LOOKBACK_DAYS);
-		const endDate = getDateNDaysAgo(1);
-
-		const { rows, totalRows } = await fetchGA4Report(
-			token, propertyId, trafficReportConfig, startDate, endDate, BATCH_SIZE, offset,
-		);
-
-		const changes = rows.map((row) => {
-			const date = row.dimensionValues[0].value;
-			const source = row.dimensionValues[1].value;
-			const medium = row.dimensionValues[2].value;
-			return {
-				type: "upsert" as const,
-				key: `${date}::${source}::${medium}`,
-				properties: {
-					"Name": Builder.title(`${date}::${source}::${medium}`),
-					"Date": Builder.date(formatGA4Date(date)),
-					"Session Source": Builder.richText(source),
-					"Session Medium": Builder.richText(medium),
-					"Sessions": Builder.number(parseInt(row.metricValues[0].value, 10)),
-					"Users": Builder.number(parseInt(row.metricValues[1].value, 10)),
-				},
-			};
-		});
-
-		const nextOffset = offset + rows.length;
-		const hasMore = nextOffset < totalRows;
-
-		return {
-			changes,
-			hasMore,
-			nextState: hasMore ? { offset: nextOffset } : undefined,
-		};
-	},
+worker.sync("trafficSourceMediumDelta", {
+	database: trafficDb,
+	mode: "incremental",
+	schedule: "1h",
+	execute: makeGA4Execute({
+		config: trafficReportConfig,
+		mapRow: mapTrafficRow,
+		startDate: () => getDateNDaysAgo(DELTA_LOOKBACK_DAYS),
+		endDate: () => getDateNDaysAgo(1),
+	}),
 });
